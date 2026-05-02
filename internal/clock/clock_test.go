@@ -1,6 +1,8 @@
 package clock
 
-import "testing"
+import (
+	"testing"
+)
 
 // TestCompare is the most critical test — covers all 4 causal relationships
 // with concrete scenarios that mirror real distributed system events.
@@ -192,6 +194,12 @@ func TestMerge(t *testing.T) {
 			name:     "merge_with_missing_key",
 			a:        VectorClock{"A": 1},
 			b:        VectorClock{"A": 1, "B": 2},
+			expected: VectorClock{"A": 1, "B": 2},
+		},
+		{
+			name:     "merge_with_missing_key_2",
+			a:        VectorClock{"A": 1},
+			b:        VectorClock{"B": 2},
 			expected: VectorClock{"A": 1, "B": 2},
 		},
 		{
