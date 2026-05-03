@@ -6,6 +6,7 @@
 package storage
 
 import (
+	"bytes"
 	"time"
 
 	"github.com/harshjoeyit/vectorclock/internal/clock"
@@ -25,7 +26,9 @@ func (v VersionedValue) IsDominatedBy(other VersionedValue) bool {
 	return other.Clock.Dominates(v.Clock)
 }
 
-// What the store holds per key. If multiple, it's conflict
-type KeyEntry struct {
-	Siblings []VersionedValue // len > 1 means unreconciled conflict
+func EqualVersionedValue(a, b VersionedValue) bool {
+	return bytes.Equal(a.Value, b.Value) &&
+		clock.EqualVectorClock(a.Clock, b.Clock) &&
+		a.NodeID == b.NodeID &&
+		a.Timestamp.Equal(b.Timestamp)
 }

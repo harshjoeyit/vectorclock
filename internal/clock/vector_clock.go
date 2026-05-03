@@ -7,6 +7,7 @@ package clock
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 )
@@ -54,6 +55,10 @@ type VectorClock map[string]uint64
 // New returns an empty VectorClock.
 func New() VectorClock {
 	return make(VectorClock)
+}
+
+func EqualVectorClock(a, b VectorClock) bool {
+	return maps.Equal(a, b)
 }
 
 // Increment returns a NEW clock with the counter for nodeID incremented by 1.
