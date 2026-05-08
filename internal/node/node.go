@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
@@ -39,6 +40,10 @@ type NodeConfig struct {
 	// DropRate: probability [0.0, 1.0] that an outbound replication
 	// message is silently dropped. Simulates packet loss / partition.
 	DropRate float64
+}
+
+func (n NodeConfig) Addr() string {
+	return n.addr
 }
 
 func DefaultConfig(addr string) NodeConfig {
@@ -92,18 +97,21 @@ func (n *Node) ID() string { return n.id }
 // Store exposes the underlying store for coordinator access.
 func (n *Node) Store() *storage.Store { return n.store }
 
+func (n *Node) Config() NodeConfig { return n.config }
+
 // --- Lifecycle -----------------------------------------------------------
 
-// Start boots the HTTP server in a background goroutine.
+// Start boots the node's HTTP server.
 func (n *Node) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /keys/{key}", n.handlePut)
 	mux.HandleFunc("GET /keys/{key}", n.handleGet)
+	mux.HandleFunc("GET /internal/versions/{key}", n.handleGetVersions)
 	mux.HandleFunc("POST /internal/replicate/{key}", n.handleReplicate)
 
 	ln, err := net.Listen("tcp", n.config.addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("node %s: listen: %w", n.id, err)
 	}
 
 	n.server = &http.Server{
@@ -130,9 +138,9 @@ func (n *Node) Stop(ctx context.Context) error {
 
 // --- HTTP Handlers -------------------------------------------------------
 
-// wireValue is the JSON shape used on the wire.
+// WireValue is the JSON shape used on the wire.
 // Keeping it explicit (not exposing storage internals) is intentional.
-type wireValue struct {
+type WireValue struct {
 	Value  []byte            `json:"value"`
 	Clock  clock.VectorClock `json:"clock"`
 	NodeID string            `json:"node_id"`
@@ -142,7 +150,7 @@ type wireValue struct {
 
 // -- helper functions for conversion
 
-func (wv wireValue) toVersionedValue() storage.VersionedValue {
+func (wv WireValue) ToVersionedValue() storage.VersionedValue {
 	return storage.VersionedValue{
 		Value:     wv.Value,
 		Clock:     wv.Clock,
@@ -151,8 +159,8 @@ func (wv wireValue) toVersionedValue() storage.VersionedValue {
 	}
 }
 
-func toWireValue(vv storage.VersionedValue) wireValue {
-	return wireValue{
+func toWireValue(vv storage.VersionedValue) WireValue {
+	return WireValue{
 		Value:    vv.Value,
 		Clock:    vv.Clock,
 		NodeID:   vv.NodeID,
@@ -179,7 +187,7 @@ type PutResponse struct {
 // the client is responsible for reconciliation.
 type GetResponse struct {
 	HasConflict bool        `json:"has_conflict"`
-	Siblings    []wireValue `json:"siblings"`
+	Siblings    []WireValue `json:"siblings"`
 }
 
 // handlePut handles client write requests.
@@ -257,7 +265,7 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := GetResponse{HasConflict: result.HasConflict}
-	resp.Siblings = make([]wireValue, 0, len(result.Siblings)) // allocate space
+	resp.Siblings = make([]WireValue, 0, len(result.Siblings)) // allocate space
 	for _, sib := range result.Siblings {
 		resp.Siblings = append(resp.Siblings, toWireValue(sib))
 	}
@@ -272,10 +280,50 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleGetVersions is the internal read endpoint used by the coordinator.
+// Unlike handleGet (which is client-facing and may trigger reconciliation
+// at a higher layer), this returns raw siblings with no interpretation.
+// The coordinator collects these from R nodes and does its own pruning.
+func (n *Node) handleGetVersions(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+
+	result := n.store.Get(key)
+	if !result.Found {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	var siblings []WireValue
+	for _, sib := range result.Siblings {
+		siblings = append(siblings, toWireValue(sib))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(siblings)
+}
+
 // -- helper
-func mustRequestWithCtx(ctx context.Context, method, url string, body []byte) *http.Request {
-	req, _ := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+func MustRequestWithCtx(ctx context.Context, method, url string, body []byte) *http.Request {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+
+	// log.Printf("making HTTP %s request to: %s", method, url)
+
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		log.Fatalf("failed to make method: %s request to url: %s", method, url)
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
 	return req
 }
 

@@ -1,18 +1,12 @@
-// cmd/main.go — Vector Clock demo
-//
-// Runs 4 scenarios that mirror real DynamoDB behaviour:
-//
-//	Scenario 1: Linear writes — clean causal chain, no conflict
-//	Scenario 2: Network partition — concurrent writes produce siblings
-//	Scenario 3: Read repair — coordinator detects and resolves conflict
-//	Scenario 4: Stale replication — late message is silently discarded
+// cmd/main.go
+
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/harshjoeyit/vectorclock/internal/clock"
@@ -22,287 +16,366 @@ import (
 )
 
 const (
-	reset  = "\033[0m"
-	bold   = "\033[1m"
-	red    = "\033[31m"
-	green  = "\033[32m"
-	yellow = "\033[33m"
-	cyan   = "\033[36m"
-	gray   = "\033[90m"
+	basePort = 19100
 )
 
-func header(s string) {
-	fmt.Printf("\n%s%s━━━ %s %s━━━%s\n\n", bold, cyan, s, strings.Repeat("━", max(0, 50-len(s))), reset)
-}
-
-func step(format string, args ...any) {
-	fmt.Printf("  %s▶%s  "+format+"\n", append([]any{yellow, reset}, args...)...)
-}
-
-func ok(format string, args ...any) {
-	fmt.Printf("  %s✓%s  "+format+"\n", append([]any{green, reset}, args...)...)
-}
-
-func conflict(format string, args ...any) {
-	fmt.Printf("  %s⚡%s  "+format+"\n", append([]any{red, reset}, args...)...)
-}
-
-func info(format string, args ...any) {
-	fmt.Printf("  %s·%s  "+format+"\n", append([]any{gray, reset}, args...)...)
+func printSection(title string) {
+	fmt.Printf("\n=== %s ===\n\n", title)
 }
 
 func dumpNodes(nodes []*node.Node, key string) {
 	for _, nd := range nodes {
 		r := nd.Store().Get(key)
+
 		if !r.Found {
-			info("node=%-6s  <no data>", nd.ID())
+			fmt.Printf("%s -> no data\n", nd.ID())
 			continue
 		}
+
 		if r.HasConflict {
-			conflict("node=%-6s  %d SIBLINGS:", nd.ID(), len(r.Siblings))
+			fmt.Printf("%s -> %d siblings\n", nd.ID(), len(r.Siblings))
 			for i, sib := range r.Siblings {
-				info("           [%d] clock=%-28s value=%s", i, sib.Clock, sib.Value)
+				fmt.Printf("  [%d] clock=%s value=%s\n", i, sib.Clock, sib.Value)
 			}
-		} else {
-			ok("node=%-6s  clock=%-28s value=%s", nd.ID(), r.Siblings[0].Clock, r.Siblings[0].Value)
+			continue
 		}
+
+		fmt.Printf("%s -> clock=%s value=%s\n",
+			nd.ID(),
+			r.Siblings[0].Clock,
+			r.Siblings[0].Value,
+		)
 	}
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// ── cluster bootstrap ─────────────────────────────────────────────────────
-
-func makeCluster(basePort int, reconcileFn coordinator.ReconcileFunc) (*coordinator.Coordinator, []*node.Node) {
+func makeCluster(reconcileFn coordinator.ReconcileFunc) (*coordinator.Coordinator, []*node.Node) {
 	nodes := make([]*node.Node, 3)
+
 	for i := range nodes {
 		addr := fmt.Sprintf(":%d", basePort+i)
 		cfg := node.DefaultConfig(addr)
 		cfg.MinLatency = 0
 		cfg.MaxLatency = 0
+
 		nodes[i] = node.New(fmt.Sprintf("node%d", i+1), cfg)
+
+		if err := nodes[i].Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start node%d: %v\n", i+1, err)
+			os.Exit(1)
+		}
 	}
+
+	for i, nd := range nodes {
+		for j, peer := range nodes {
+			if i == j {
+				continue
+			}
+
+			nd.AddPeer(node.Peer{
+				ID:   peer.ID(),
+				Addr: fmt.Sprintf("http://localhost%s", peer.Config().Addr()),
+			})
+		}
+	}
+
+	nodeAddrs := make([]node.Peer, len(nodes))
+
+	for i, nd := range nodes {
+		nodeAddrs[i] = node.Peer{
+			ID:   nd.ID(),
+			Addr: fmt.Sprintf("http://localhost%s", nd.Config().Addr()),
+		}
+	}
+
 	q := coordinator.DefaultQuorum(len(nodes))
-	coord := coordinator.New("coordinator", nodes, q, reconcileFn)
+	addr := fmt.Sprintf(":%d", basePort-10)
+	coord := coordinator.New(
+		"coordinator",
+		nodeAddrs,
+		q,
+		reconcileFn,
+		addr,
+	)
+
+	if err := coord.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start coordinator: %v\n", err)
+		os.Exit(1)
+	}
+
 	return coord, nodes
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Scenario 1: Linear writes
-// ─────────────────────────────────────────────────────────────────────────
-
 func scenario1() {
-	header("Scenario 1: Linear Writes — No Conflict")
-	fmt.Println("  User adds items to cart sequentially.")
-	fmt.Println("  Each write knows about the previous one → clean causal chain.\n")
+	printSection("Scenario 1: Linear Writes")
 
-	coord, nodes := makeCluster(19100, coordinator.ReturnAll)
+	coord, nodes := makeCluster(coordinator.ReturnAll)
 	ctx := context.Background()
 
-	writes := []string{`["shoes"]`, `["shoes","shirt"]`, `["shoes","shirt","watch"]`}
+	writes := []string{
+		`["shoes"]`,
+		`["shoes","shirt"]`,
+		`["shoes","shirt","watch"]`,
+	}
+
 	for _, v := range writes {
-		step("Writing: %s", v)
-		r, err := coord.Put(ctx, "cart", []byte(v))
+		fmt.Printf("writing %s\n", v)
+
+		r, err := coord.Put(ctx, "cart", []byte(v), nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)
 			return
 		}
-		ok("Accepted  clock=%s", r.Clock)
+
+		fmt.Printf("clock=%s\n", r.Clock)
 	}
 
 	fmt.Println()
-	step("State across all nodes:")
 	dumpNodes(nodes, "cart")
 
 	r, _ := coord.Get(ctx, "cart")
+
 	fmt.Println()
+
 	if r.HasConflict {
-		conflict("Unexpected conflict — %d siblings", len(r.Siblings))
-	} else {
-		ok("Clean read: %s", r.Siblings[0].Value)
+		fmt.Printf("unexpected conflict: %d siblings\n", len(r.Siblings))
+		return
 	}
+
+	fmt.Printf("clean read: %s\n", r.Siblings[0].Value)
 }
 
 func scenario2() {
-	header("Scenario 2: Network Partition → Concurrent Siblings")
-	fmt.Println("  User has cart open on phone AND laptop simultaneously.")
-	fmt.Println("  Partition means neither write sees the other.\n")
+	printSection("Scenario 2: Network Partition")
 
-	_, nodes := makeCluster(19100, coordinator.ReturnAll)
+	_, nodes := makeCluster(coordinator.ReturnAll)
 
-	// Common ancestor — both clients last saw this version
 	base := storage.VersionedValue{
 		Value:     []byte(`["shoes"]`),
 		Clock:     clock.VectorClock{"node1": 1},
 		NodeID:    "node1",
 		Timestamp: time.Now(),
 	}
+
 	for _, nd := range nodes {
 		nd.Store().Put("cart", base)
 	}
-	step("Common ancestor written to all nodes: clock=%s value=%s", base.Clock, base.Value)
 
-	// Partition starts — node1 and node2 write independently
-	fmt.Println()
-	step("── Partition begins — nodes stop replicating ──")
-	fmt.Println()
+	fmt.Printf("base version: clock=%s value=%s\n\n", base.Clock, base.Value)
 
 	phoneWrite := storage.VersionedValue{
 		Value:     []byte(`["shoes","watch"]`),
-		Clock:     clock.VectorClock{"node1": 2}, // only saw node1:1, incremented node1
+		Clock:     clock.VectorClock{"node1": 2},
 		NodeID:    "node1",
 		Timestamp: time.Now(),
 	}
+
 	laptopWrite := storage.VersionedValue{
 		Value:     []byte(`["shoes","shirt"]`),
-		Clock:     clock.VectorClock{"node1": 1, "node2": 1}, // only saw node1:1, incremented node2
+		Clock:     clock.VectorClock{"node1": 1, "node2": 1},
 		NodeID:    "node2",
 		Timestamp: time.Now().Add(50 * time.Millisecond),
 	}
 
 	nodes[0].Store().Put("cart", phoneWrite)
-	step("Phone  → node1: clock=%s value=%s", phoneWrite.Clock, phoneWrite.Value)
-
 	nodes[1].Store().Put("cart", laptopWrite)
-	step("Laptop → node2: clock=%s value=%s", laptopWrite.Clock, laptopWrite.Value)
 
-	fmt.Println()
-	step("── Partition heals — node2 replicates to node1 ──")
-	fmt.Println()
+	fmt.Printf("phone write  -> clock=%s value=%s\n",
+		phoneWrite.Clock,
+		phoneWrite.Value,
+	)
+
+	fmt.Printf("laptop write -> clock=%s value=%s\n\n",
+		laptopWrite.Clock,
+		laptopWrite.Value,
+	)
 
 	result := nodes[0].Store().Put("cart", laptopWrite)
-	fmt.Printf("  Store result on node1: %s%s%s\n\n", red, result, reset)
 
-	step("State across all nodes:")
+	fmt.Printf("replication result: %s\n\n", result)
+
 	dumpNodes(nodes, "cart")
 
 	fmt.Println()
-	info("Clock comparison:")
-	r1 := phoneWrite.Clock.Compare(laptopWrite.Clock)
-	info("  phone=%s  laptop=%s  relation=%s%s%s",
-		phoneWrite.Clock, laptopWrite.Clock, red, r1, reset)
-	info("  Neither dominates the other → both must be retained as siblings")
+
+	rel := phoneWrite.Clock.Compare(laptopWrite.Clock)
+
+	fmt.Printf("phone=%s\n", phoneWrite.Clock)
+	fmt.Printf("laptop=%s\n", laptopWrite.Clock)
+	fmt.Printf("relation=%s\n", rel)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Scenario 3: Read repair
-// ─────────────────────────────────────────────────────────────────────────
-
 func scenario3() {
-	header("Scenario 3: Read Repair — Coordinator Resolves Conflict")
-	fmt.Println("  Same partition as Scenario 2, but now the coordinator")
-	fmt.Println("  detects conflict on read and automatically reconciles.\n")
+	printSection("Scenario 3: Read Repair")
 
-	coord, nodes := makeCluster(19100, coordinator.UnionMerge)
+	coord, nodes := makeCluster(coordinator.UnionMerge)
 	ctx := context.Background()
 
-	// Inject the same conflict directly into stores
 	v1 := storage.VersionedValue{
 		Value:     []byte(`["shoes","watch"]`),
 		Clock:     clock.VectorClock{"node1": 2},
 		NodeID:    "node1",
 		Timestamp: time.Now(),
 	}
+
 	v2 := storage.VersionedValue{
 		Value:     []byte(`["shoes","shirt"]`),
 		Clock:     clock.VectorClock{"node1": 1, "node2": 1},
 		NodeID:    "node2",
 		Timestamp: time.Now().Add(time.Millisecond),
 	}
+
 	nodes[0].Store().Put("cart", v1)
 	nodes[1].Store().Put("cart", v2)
 	nodes[2].Store().Put("cart", v1)
 	nodes[2].Store().Put("cart", v2)
 
-	step("Pre-repair state:")
+	fmt.Println("before repair:")
 	dumpNodes(nodes, "cart")
 
 	fmt.Println()
-	step("Client reads cart...")
+
 	result, err := coord.Get(ctx, "cart")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Get failed: %v\n", err)
 		return
 	}
 
-	fmt.Println()
 	if result.ReadRepaired {
-		ok("Read repair triggered!")
-		ok("Reconciled value : %s", result.Siblings[0].Value)
-		ok("Reconciled clock : %s", result.Siblings[0].Clock)
-		info("(clock is MAX of all siblings — dominates both)")
+		fmt.Println("read repair triggered")
+		fmt.Printf("value=%s\n", result.Siblings[0].Value)
+		fmt.Printf("clock=%s\n", result.Siblings[0].Clock)
 	}
 
-	// Wait for write-back goroutines
 	time.Sleep(50 * time.Millisecond)
 
 	fmt.Println()
-	step("Post-repair state:")
+	fmt.Println("after repair:")
+
 	dumpNodes(nodes, "cart")
 
 	fmt.Println()
-	step("Verify reconciled clock dominates both siblings:")
+
 	rc := result.Siblings[0].Clock
-	info("reconciled=%s", rc)
-	info("sibling v1=%s  dominated=%v", v1.Clock, rc.Dominates(v1.Clock))
-	info("sibling v2=%s  dominated=%v", v2.Clock, rc.Dominates(v2.Clock))
+
+	fmt.Printf("reconciled=%s\n", rc)
+	fmt.Printf("dominates v1=%v\n", rc.Dominates(v1.Clock))
+	fmt.Printf("dominates v2=%v\n", rc.Dominates(v2.Clock))
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Scenario 4: Stale replication — late message discarded
-// ─────────────────────────────────────────────────────────────────────────
-
 func scenario4() {
-	header("Scenario 4: Stale Replication — Late Message Discarded")
-	fmt.Println("  A replication message for an old version arrives")
-	fmt.Println("  after a newer version is already present.\n")
+	printSection("Scenario 4: Stale Replication")
 
-	coord, nodes := makeCluster(19100, coordinator.ReturnAll)
+	coord, nodes := makeCluster(coordinator.ReturnAll)
 	ctx := context.Background()
 
-	step("Writing v1: [\"shoes\"]")
-	r1, _ := coord.Put(ctx, "cart", []byte(`["shoes"]`))
-	ok("v1 clock: %s", r1.Clock)
+	r1, _ := coord.Put(
+		ctx,
+		"cart",
+		[]byte(`["shoes"]`),
+		nil,
+	)
 
-	step("Writing v2: [\"shoes\",\"shirt\"]  (causal successor of v1)")
-	r2, _ := coord.Put(ctx, "cart", []byte(`["shoes","shirt"]`))
-	ok("v2 clock: %s", r2.Clock)
+	fmt.Printf("v1 clock=%s\n", r1.Clock)
 
-	fmt.Println()
-	step("State after v2:")
+	r2, _ := coord.Put(
+		ctx,
+		"cart",
+		[]byte(`["shoes","shirt"]`),
+		r1.Clock,
+	)
+
+	fmt.Printf("v2 clock=%s\n\n", r2.Clock)
+
 	dumpNodes(nodes, "cart")
 
-	// Simulate a delayed replication of v1 arriving on node1
 	fmt.Println()
-	step("Late replication arrives: v1 clock=%s", r1.Clock)
+
 	stale := storage.VersionedValue{
 		Value:     []byte(`["shoes"]`),
 		Clock:     r1.Clock,
 		NodeID:    "node1",
 		Timestamp: time.Now(),
 	}
-	result := nodes[0].Store().Put("cart", stale)
-	fmt.Printf("  Store result: %s%s%s\n", yellow, result, reset)
 
-	fmt.Println()
-	step("State after stale write attempt:")
+	result := nodes[0].Store().Put("cart", stale)
+
+	fmt.Printf("stale replication result: %s\n\n", result)
+
 	dumpNodes(nodes, "cart")
 
 	fmt.Println()
-	info("v1 clock=%s", r1.Clock)
-	info("v2 clock=%s", r2.Clock)
+
 	rel := r1.Clock.Compare(r2.Clock)
-	info("v1 relation to v2: %s → v1 is an ancestor, safe to discard", rel)
+
+	fmt.Printf("v1=%s\n", r1.Clock)
+	fmt.Printf("v2=%s\n", r2.Clock)
+	fmt.Printf("relation=%s\n", rel)
+}
+
+func clockTable() {
+	printSection("Clock Comparison Rules")
+
+	type row struct {
+		a    clock.VectorClock
+		b    clock.VectorClock
+		desc string
+	}
+
+	rows := []row{
+		{
+			clock.VectorClock{"A": 1},
+			clock.VectorClock{"A": 2},
+			"ancestor",
+		},
+		{
+			clock.VectorClock{"A": 2},
+			clock.VectorClock{"A": 1},
+			"descendant",
+		},
+		{
+			clock.VectorClock{"A": 2},
+			clock.VectorClock{"A": 1, "B": 1},
+			"concurrent",
+		},
+		{
+			clock.VectorClock{"A": 1},
+			clock.VectorClock{"A": 1},
+			"equal",
+		},
+	}
+
+	for _, r := range rows {
+		fmt.Printf(
+			"%s  vs  %s  =>  %s (%s)\n",
+			r.a,
+			r.b,
+			r.a.Compare(r.b),
+			r.desc,
+		)
+	}
+
+	fmt.Println()
+
+	vc := clock.VectorClock{
+		"node1":       3,
+		"node2":       1,
+		"coordinator": 2,
+	}
+
+	b, _ := json.MarshalIndent(vc, "", "  ")
+
+	fmt.Println("json:")
+	fmt.Println(string(b))
 }
 
 func main() {
+	fmt.Println("Vector Clock Demo")
+
 	scenario1()
 	// scenario2()
 	// scenario3()
 	// scenario4()
+	// clockTable()
+
+	fmt.Println("\ndone")
 }

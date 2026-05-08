@@ -10,6 +10,10 @@ import (
 	"github.com/harshjoeyit/vectorclock/internal/storage"
 )
 
+const (
+	ReplicationTimeoutInSecs = 60 * time.Second
+)
+
 // handleGet handles client read requests.
 // Returns all siblings — if HasConflict is true the client must reconcile.
 func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
@@ -19,13 +23,14 @@ func (n *Node) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var wv wireValue
+	var wv WireValue
 	if err := json.NewDecoder(r.Body).Decode(&wv); err != nil {
 		http.Error(w, "bad request body", http.StatusBadRequest)
 		return
 	}
-	wv.toVersionedValue()
-	result := n.store.Put(key, wv.toVersionedValue())
+
+	vv := wv.ToVersionedValue()
+	result := n.store.Put(key, vv)
 	n.logger.Printf("REPLICATED key=%q result=%s clock=%s", key, result, wv.Clock)
 
 	w.WriteHeader(http.StatusNoContent)
@@ -42,7 +47,7 @@ func (n *Node) replicate(key string, vv storage.VersionedValue) {
 	copy(peers, n.peers)
 	n.mu.RUnlock()
 
-	// Convert VersionedValue to wireValue
+	// Convert VersionedValue to WireValue
 	body, _ := json.Marshal(toWireValue(vv))
 
 	for _, peer := range n.peers {
@@ -58,10 +63,10 @@ func (n *Node) replicate(key string, vv storage.VersionedValue) {
 			}
 
 			url := fmt.Sprintf("%s/internal/replicate/%s", p.Addr, key)
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), ReplicationTimeoutInSecs)
 			defer cancel()
 
-			resp, err := http.DefaultClient.Do(mustRequestWithCtx(ctx, http.MethodPost, url, body))
+			resp, err := http.DefaultClient.Do(MustRequestWithCtx(ctx, http.MethodPost, url, body))
 			if err != nil {
 				n.logger.Printf("REPLICATE key=%q → %s FAILED: %v", key, p.ID, err)
 				return

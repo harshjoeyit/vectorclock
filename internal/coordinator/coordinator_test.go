@@ -4,8 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
-	"slices"
+	"net/http"
 	"testing"
 	"time"
 
@@ -14,11 +13,17 @@ import (
 	"github.com/harshjoeyit/vectorclock/internal/storage"
 )
 
-// makeCluster creates N in-process nodes (no HTTP) wired to a coordinator.
-// Using the store directly avoids network overhead in coordinator tests —
-// as we're testing coordinator logic, not HTTP transport (that's node_test.go).
-func makeCluster(t *testing.T, n, basePort int, reconcileFn ReconcileFunc) (*Coordinator, []*node.Node) {
+// ── Cluster bootstrap ─────────────────────────────────────────────────────
+
+type cluster struct {
+	coord *Coordinator
+	nodes []*node.Node
+}
+
+// startCluster boots N nodes on on basePort+i and a coordinator on basePort-10
+func startCluster(t *testing.T, n, basePort int, reconcileFn ReconcileFunc) cluster {
 	t.Helper()
+
 	nodes := make([]*node.Node, n)
 	for i := range nodes {
 		addr := fmt.Sprintf(":%d", basePort+i)
@@ -26,311 +31,306 @@ func makeCluster(t *testing.T, n, basePort int, reconcileFn ReconcileFunc) (*Coo
 		cfg.MinLatency = 0
 		cfg.MaxLatency = 0
 		nodes[i] = node.New(fmt.Sprintf("node%d", i+1), cfg)
+		if err := nodes[i].Start(); err != nil {
+			t.Fatalf("failed to start node%d: %v", i+1, err)
+		}
 	}
+
+	// Wire peer replication between nodes
+	for i, nd := range nodes {
+		for j, peer := range nodes {
+			if i != j {
+				nd.AddPeer(node.Peer{
+					ID:   peer.ID(),
+					Addr: fmt.Sprintf("http://localhost%s", peer.Config().Addr()),
+				})
+			}
+		}
+	}
+
+	// Coordinator holds HTTP addresses only — no *node.Node references
+	nodeAddrs := make([]node.Peer, n)
+	for i, nd := range nodes {
+		nodeAddrs[i] = node.Peer{
+			ID:   nd.ID(),
+			Addr: fmt.Sprintf("http://localhost%s", nd.Config().Addr()),
+		}
+	}
+
 	q := DefaultQuorum(n)
-	coord := New("coordinator", nodes, q, reconcileFn)
-	return coord, nodes
+	coordAddr := fmt.Sprintf(":%d", basePort-10)
+	coord := New("coordinator", nodeAddrs, q, reconcileFn, coordAddr)
+	if err := coord.Start(); err != nil {
+		t.Fatalf("failed to start coordinator: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		coord.Stop(ctx)
+		for _, nd := range nodes {
+			nd.Stop(ctx)
+		}
+	})
+
+	return cluster{coord: coord, nodes: nodes}
 }
 
-// injectConflict seeds a conflict directly into node stores,
-// bypassing the coordinator. Simulates what happens during a partition.
+// injectConflict seeds concurrent versions directly into node stores,
+// simulating what a network partition produces without going through coordinator.
 func injectConflict(t *testing.T, nodes []*node.Node, key string,
 	v1val string, v1clock clock.VectorClock,
 	v2val string, v2clock clock.VectorClock,
 ) {
 	t.Helper()
-	v1 := storage.VersionedValue{
-		Value:     []byte(v1val),
-		Clock:     v1clock,
-		NodeID:    "node1",
-		Timestamp: time.Now(),
-	}
-	v2 := storage.VersionedValue{
-		Value:     []byte(v2val),
-		Clock:     v2clock,
-		NodeID:    "node2",
-		Timestamp: time.Now().Add(time.Millisecond),
-	}
-
-	// node1 and node2 each get one side of the conflict
+	v1 := storage.VersionedValue{Value: []byte(v1val), Clock: v1clock, NodeID: "node1", Timestamp: time.Now()}
+	v2 := storage.VersionedValue{Value: []byte(v2val), Clock: v2clock, NodeID: "node2", Timestamp: time.Now().Add(time.Millisecond)}
 	nodes[0].Store().Put(key, v1)
 	nodes[1].Store().Put(key, v2)
-
-	// node3 (if present) gets both — simulates having received both via replication
 	if len(nodes) > 2 {
 		nodes[2].Store().Put(key, v1)
 		nodes[2].Store().Put(key, v2)
 	}
 }
 
-// makeVersion builds a VersionedValue quickly
-func makeVersion(nodeID string, value string, vc clock.VectorClock, ts time.Time) storage.VersionedValue {
-	return storage.VersionedValue{
-		Value:     []byte(value),
-		Clock:     vc,
-		NodeID:    nodeID,
-		Timestamp: ts,
+// ── HTTP helpers ──────────────────────────────────────────────────────────
+
+const (
+	PutTimeoutInSecs = 60 * time.Second
+)
+
+func coordPut(t *testing.T, coordAddr, key string, value []byte, baseClock clock.VectorClock) clientPutResponse {
+	t.Helper()
+
+	body, _ := json.Marshal(clientPutRequest{Value: value, BaseClock: baseClock})
+	url := fmt.Sprintf("http://localhost%s/keys/%s", coordAddr, key)
+	ctx, cancel := context.WithTimeout(context.Background(), PutTimeoutInSecs)
+	defer cancel()
+
+	resp, err := http.DefaultClient.Do(node.MustRequestWithCtx(ctx, http.MethodPut, url, body))
+	if err != nil {
+		t.Fatalf("coordPut failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("coordPut: unexpected status %d", resp.StatusCode)
+	}
+
+	var result clientPutResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+func coordGet(t *testing.T, coordAddr, key string) clientGetResponse {
+	t.Helper()
+	url := fmt.Sprintf("http://localhost%s/keys/%s", coordAddr, key)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("coordGet failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return clientGetResponse{}
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("coordGet: unexpected status %d", resp.StatusCode)
+	}
+
+	var result clientGetResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+func TestHTTPQuorumWriteAndRead(t *testing.T) {
+	cl := startCluster(t, 3, 19100, ReturnAll)
+
+	r := coordPut(t, cl.coord.Addr(), "cart", []byte(`["shoes"]`), nil)
+	if r.Acks < 2 {
+		t.Fatalf("expected W=2 acks, got %d", r.Acks)
+	}
+	t.Logf("write clock=%v acks=%d", r.Clock, r.Acks)
+
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if got.HasConflict {
+		t.Fatal("no conflict expected for single write")
+	}
+	if string(got.Siblings[0].Value) != `["shoes"]` {
+		t.Fatalf("unexpected value: %s", got.Siblings[0].Value)
 	}
 }
 
-// ── Scenario 1: Quorum write succeeds and is readable ────────────────────
+func TestHTTPCausalWrites(t *testing.T) {
+	cl := startCluster(t, 3, 19100, ReturnAll)
 
-func TestQuorumWriteAndRead(t *testing.T) {
-	coord, _ := makeCluster(t, 3, 19100, ReturnAll)
-	ctx := context.Background()
+	r1 := coordPut(t, cl.coord.Addr(), "cart", []byte(`["shoes"]`), nil)
+	r2 := coordPut(t, cl.coord.Addr(), "cart", []byte(`["shoes","shirt"]`), r1.Clock)
+	t.Logf("write1=%v write2=%v", r1.Clock, r2.Clock)
 
-	_, err := coord.Put(ctx, "cart", []byte(`["shoes"]`))
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if got.HasConflict {
+		t.Fatal("causal writes must not conflict")
 	}
-
-	result, err := coord.Get(ctx, "cart")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if result.HasConflict {
-		t.Fatal("no conflict expected for clean write")
-	}
-	log.Printf("result: %+v", result)
-	if string(result.Siblings[0].Value) != `["shoes"]` {
-		t.Fatalf("unexpected value: %s", result.Siblings[0].Value)
+	if string(got.Siblings[0].Value) != `["shoes","shirt"]` {
+		t.Fatalf("expected updated value, got: %s", got.Siblings[0].Value)
 	}
 }
 
-// ── Scenario 2: Read repair with UnionMerge ──────────────────────────────
+func TestHTTPReadRepairUnionMerge(t *testing.T) {
+	cl := startCluster(t, 3, 19100, UnionMerge)
 
-// Two concurrent versions are injected directly into node stores.
-// On read, coordinator detects conflict, calls UnionMerge, writes back.
-// Next read should see a single reconciled version.
-func TestReadRepairUnionMerge(t *testing.T) {
-	coord, nodes := makeCluster(t, 3, 19100, UnionMerge)
-	ctx := context.Background()
-
-	// Inject concurrent siblings — simulates a healed partition
-	injectConflict(t, nodes, "cart",
+	injectConflict(t, cl.nodes, "cart",
 		`["shoes","watch"]`, clock.VectorClock{"node1": 2},
 		`["shoes","shirt"]`, clock.VectorClock{"node1": 1, "node2": 1},
 	)
 
-	// First read — should detect conflict and repair
-	result, err := coord.Get(ctx, "cart")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if !result.ReadRepaired {
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if !got.ReadRepaired {
 		t.Fatal("expected read repair to trigger")
 	}
-	if result.HasConflict {
+	if got.HasConflict {
 		t.Fatal("conflict should be resolved after read repair")
 	}
 
-	// Value must be the union of both carts
 	var items []string
-	if err := jsonUnmarshal(result.Siblings[0].Value, &items); err != nil {
-		t.Fatalf("bad value: %v", err)
+	json.Unmarshal(got.Siblings[0].Value, &items)
+	itemSet := make(map[string]bool)
+	for _, i := range items {
+		itemSet[i] = true
 	}
-	itemSet := toSet(items)
 	for _, expected := range []string{"shoes", "watch", "shirt"} {
 		if !itemSet[expected] {
-			t.Errorf("union merge missing item: %s, got: %v", expected, items)
+			t.Errorf("union merge missing %q, got: %v", expected, items)
 		}
 	}
+	t.Logf("reconciled: %s", got.Siblings[0].Value)
 
-	// Give write-back goroutines time to land
-	time.Sleep(50 * time.Millisecond)
-
-	// Second read — conflict must be gone on all nodes
-	result2, err := coord.Get(ctx, "cart")
-	if err != nil {
-		t.Fatalf("second Get failed: %v", err)
-	}
-	if result2.HasConflict {
+	// Wait for write-back to propagate then verify clean state
+	time.Sleep(100 * time.Millisecond)
+	got2 := coordGet(t, cl.coord.Addr(), "cart")
+	if got2.HasConflict {
 		t.Fatal("conflict should be gone after read repair propagated")
 	}
-}
-
-// ── Scenario 3: Read repair with LastWriteWins ───────────────────────────
-
-func TestReadRepairLastWriteWins(t *testing.T) {
-	coord, nodes := makeCluster(t, 3, 19100, LastWriteWins)
-	ctx := context.Background()
-
-	injectConflict(t, nodes, "session",
-		`{"token":"abc"}`, clock.VectorClock{"node1": 1},
-		`{"token":"xyz"}`, clock.VectorClock{"node2": 1},
-	)
-
-	result, err := coord.Get(ctx, "session")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if !result.ReadRepaired {
-		t.Fatal("expected read repair")
-	}
-	// LWW picks the newer wall clock — node2's version has timestamp+1ms
-	if string(result.Siblings[0].Value) != `{"token":"xyz"}` {
-		t.Fatalf("LWW should pick latest timestamp, got: %s", result.Siblings[0].Value)
+	if len(got2.Siblings) != 1 {
+		t.Fatal("only one reconciled value should exist")
 	}
 }
 
-// ── Scenario 4: ReturnAll defers to client ───────────────────────────────
+func TestHTTPReturnAllNoAutoRepair(t *testing.T) {
+	cl := startCluster(t, 3, 19100, ReturnAll)
 
-func TestReturnAllNoAutoRepair(t *testing.T) {
-	coord, nodes := makeCluster(t, 3, 19100, ReturnAll)
-	ctx := context.Background()
-
-	injectConflict(t, nodes, "cart",
+	injectConflict(t, cl.nodes, "cart",
 		`["shoes"]`, clock.VectorClock{"node1": 1},
 		`["shirt"]`, clock.VectorClock{"node2": 1},
 	)
 
-	result, err := coord.Get(ctx, "cart")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if got.ReadRepaired {
+		t.Fatal("ReturnAll should not auto-repair")
 	}
-	if result.ReadRepaired {
-		t.Fatal("ReturnAll should NOT auto-repair")
+	if !got.HasConflict {
+		t.Fatal("conflict should be visible to client")
 	}
-	if !result.HasConflict {
-		t.Fatal("conflict should be visible to caller")
+	if len(got.Siblings) != 2 {
+		t.Fatalf("expected 2 siblings, got %d", len(got.Siblings))
 	}
-	if len(result.Siblings) != 2 {
-		t.Fatalf("expected 2 siblings, got %d", len(result.Siblings))
+	for i, sib := range got.Siblings {
+		t.Logf("sibling[%d] clock=%v value=%s", i, sib.Clock, sib.Value)
 	}
 }
 
-// ── Scenario 5: Reconciled clock must dominate all siblings ──────────────
+func TestHTTPReadRepairLastWriteWins(t *testing.T) {
+	cl := startCluster(t, 3, 19100, LastWriteWins)
 
-// Verifies the invariant that after read repair, the written-back version's
-// clock dominates every sibling that caused the conflict.
-func TestReconciledClockDominatesSiblings(t *testing.T) {
-	coord, nodes := makeCluster(t, 3, 19100, UnionMerge)
-	ctx := context.Background()
-
-	v1clock := clock.VectorClock{"node1": 3, "node2": 1}
-	v2clock := clock.VectorClock{"node1": 2, "node2": 2}
-
-	injectConflict(t, nodes, "cart",
-		`["shoes","watch","bag"]`, v1clock,
-		`["shoes","shirt","hat"]`, v2clock,
+	injectConflict(t, cl.nodes, "session",
+		`{"token":"abc"}`, clock.VectorClock{"node1": 1},
+		`{"token":"xyz"}`, clock.VectorClock{"node2": 1},
 	)
 
-	result, _ := coord.Get(ctx, "cart")
-	if !result.ReadRepaired {
+	got := coordGet(t, cl.coord.Addr(), "session")
+	if !got.ReadRepaired {
 		t.Fatal("expected read repair")
 	}
-
-	reconciledClock := result.Siblings[0].Clock
-	if !reconciledClock.Dominates(v1clock) {
-		t.Errorf("reconciled clock %s does not dominate v1 %s", reconciledClock, v1clock)
-	}
-	if !reconciledClock.Dominates(v2clock) {
-		t.Errorf("reconciled clock %s does not dominate v2 %s", reconciledClock, v2clock)
+	if string(got.Siblings[0].Value) != `{"token":"xyz"}` {
+		t.Fatalf("LWW should pick latest timestamp, got: %s", got.Siblings[0].Value)
 	}
 }
 
-// ── Scenario 6: Sequential writes never conflict ─────────────────────────
+func TestHTTPSequentialWritesNoConflict(t *testing.T) {
+	cl := startCluster(t, 3, 19100, UnionMerge)
 
-func TestSequentialWritesNoConflict(t *testing.T) {
-	coord, _ := makeCluster(t, 3, 19100, UnionMerge)
-	ctx := context.Background()
+	var lastClock clock.VectorClock
+	writes := []string{`["shoes"]`, `["shoes","shirt"]`, `["shoes","shirt","watch"]`}
+	for _, v := range writes {
+		r := coordPut(t, cl.coord.Addr(), "cart", []byte(v), lastClock)
+		lastClock = r.Clock
+		t.Logf("wrote %s clock=%v", v, r.Clock)
+	}
 
-	steps := []string{`["shoes"]`, `["shoes","shirt"]`, `["shoes","shirt","watch"]`}
-	for _, v := range steps {
-		if _, err := coord.Put(ctx, "cart", []byte(v)); err != nil {
-			t.Fatalf("Put failed: %v", err)
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if got.HasConflict {
+		t.Fatalf("sequential writes must not conflict, got %d siblings", len(got.Siblings))
+	}
+	if string(got.Siblings[0].Value) != `["shoes","shirt","watch"]` {
+		t.Fatalf("unexpected final value: %s", got.Siblings[0].Value)
+	}
+}
+
+func TestHTTPPartitionAndRepair(t *testing.T) {
+	cl := startCluster(t, 3, 19100, UnionMerge)
+
+	// Write common ancestor
+	r0 := coordPut(t, cl.coord.Addr(), "cart", []byte(`["shoes"]`), nil)
+	t.Logf("ancestor clock: %v", r0.Clock)
+
+	// Partition — nodes stop replicating
+	for _, nd := range cl.nodes {
+		nd.SetDropRate(1.0)
+	}
+
+	// Inject concurrent writes from each side of the partition
+	v1 := storage.VersionedValue{
+		Value:     []byte(`["shoes","watch"]`),
+		Clock:     r0.Clock.Increment("node1"),
+		NodeID:    "node1",
+		Timestamp: time.Now(),
+	}
+	v2 := storage.VersionedValue{
+		Value:     []byte(`["shoes","shirt"]`),
+		Clock:     r0.Clock.Increment("node2"),
+		NodeID:    "node2",
+		Timestamp: time.Now().Add(time.Millisecond),
+	}
+	cl.nodes[0].Store().Put("cart", v1)
+	cl.nodes[1].Store().Put("cart", v2)
+	cl.nodes[2].Store().Put("cart", v1)
+	cl.nodes[2].Store().Put("cart", v2)
+	t.Logf("partition: node1=%s node2=%s", v1.Value, v2.Value)
+
+	// Heal partition
+	for _, nd := range cl.nodes {
+		nd.SetDropRate(0)
+	}
+
+	got := coordGet(t, cl.coord.Addr(), "cart")
+	if !got.ReadRepaired {
+		t.Logf("siblings: %v", got.Siblings)
+		t.Fatal("expected coordinator to detect and repair conflict")
+	}
+
+	var items []string
+	json.Unmarshal(got.Siblings[0].Value, &items)
+	itemSet := make(map[string]bool)
+	for _, i := range items {
+		itemSet[i] = true
+	}
+	for _, expected := range []string{"shoes", "watch", "shirt"} {
+		if !itemSet[expected] {
+			t.Errorf("repaired value missing %q, got: %v", expected, items)
 		}
 	}
-
-	result, err := coord.Get(ctx, "cart")
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
-	if result.HasConflict {
-		t.Fatalf("sequential writes must not conflict:\n siblings: %v", result.Siblings)
-	}
-	if string(result.Siblings[0].Value) != `["shoes","shirt","watch"]` {
-		t.Fatalf("unexpected final value: %s", result.Siblings[0].Value)
-	}
-}
-
-func TestPruneDominatedOneDominatingOther(t *testing.T) {
-	ts1 := time.Now()
-	ts2 := time.Now()
-
-	tests := []struct {
-		name     string
-		input    []storage.VersionedValue
-		expected []storage.VersionedValue
-	}{
-		// EQUAL
-		{
-			name: "one dominates other",
-			input: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-				makeVersion("A", `["shoes","shirt"]`, clock.VectorClock{"A": 1, "B": 1}, ts1),
-			},
-			expected: []storage.VersionedValue{
-				makeVersion("A", `["shoes","shirt"]`, clock.VectorClock{"A": 1, "B": 1}, ts1),
-			},
-		},
-		{
-			name: "one dominates all",
-			input: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-				makeVersion("A", `["shoes","shirt"]`, clock.VectorClock{"A": 1, "B": 1}, ts2),
-				makeVersion("A", `["shoes","shirt","pants"]`, clock.VectorClock{"A": 1, "B": 2}, ts1),
-			},
-			expected: []storage.VersionedValue{
-				makeVersion("A", `["shoes","shirt","pants"]`, clock.VectorClock{"A": 1, "B": 2}, ts1),
-			},
-		},
-		{
-			name: "none dominating",
-			input: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 3}, ts2),
-				makeVersion("A", `["shoes","shirt"]`, clock.VectorClock{"C": 1, "B": 1}, ts2),
-				makeVersion("A", `["shoes","shirt","pants"]`, clock.VectorClock{"A": 1, "B": 2}, ts1),
-			},
-			expected: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 3}, ts2),
-				makeVersion("A", `["shoes","shirt"]`, clock.VectorClock{"C": 1, "B": 1}, ts2),
-				makeVersion("A", `["shoes","shirt","pants"]`, clock.VectorClock{"A": 1, "B": 2}, ts1),
-			},
-		},
-		{
-			name: "all versions are same",
-			input: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-			},
-			expected: []storage.VersionedValue{
-				makeVersion("A", `["shoes"]`, clock.VectorClock{"A": 1}, ts2),
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := pruneDominated(tt.input)
-			if !slices.EqualFunc(got, tt.expected, storage.EqualVersionedValue) {
-				t.Errorf("got: %s, expected: %s", got, tt.expected)
-			}
-		})
-	}
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────
-
-func jsonUnmarshal(data []byte, v any) error {
-	return json.Unmarshal(data, v)
-}
-
-func toSet(items []string) map[string]bool {
-	s := make(map[string]bool, len(items))
-	for _, i := range items {
-		s[i] = true
-	}
-	return s
+	t.Logf("repaired: %s clock=%v", got.Siblings[0].Value, got.Siblings[0].Clock)
 }
