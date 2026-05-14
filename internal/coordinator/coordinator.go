@@ -46,6 +46,10 @@ func newNodeClient(id, addr string) NodeClient {
 
 // replicate sends a versioned value to a node via POST /internal/replicate/{key}.
 // This is the same endpoint peer nodes use — the coordinator is just another caller.
+//
+// Important Note: Replica nodes use the clock provided by the coordinator as-is.
+// Only the node that initiates or coordinates a write increments the clock.
+// Replication is propagation, not a new event.
 func (nc NodeClient) replicate(ctx context.Context, key string, vv storage.VersionedValue) error {
 	log.Printf("calling /internal/replicate/ key=%q, node=%s", key, nc.ID)
 
@@ -309,6 +313,12 @@ func (c *Coordinator) Put(ctx context.Context, key string, value []byte, baseClo
 	}
 
 	newClock = newClock.Merge(latestClock)
+
+	// Important: In Dynamo, coordinator is not a separate entity/node.
+	// It could be any node, hence, the clock increment would actually
+	// increment that node's clock. Ex - Given nodes [node1, node2, node3]
+	// in a system - and node1 is co-ordinator for the PUT, newClock would
+	// be {node1: x+1, node2: y}, given baseClock was {node1: x, node2: y}
 	newClock = newClock.Increment(c.id)
 
 	c.logger.Printf("PUT key=%q clock=%s", key, newClock)

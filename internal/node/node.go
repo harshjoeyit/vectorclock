@@ -239,6 +239,9 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 	n.logger.Printf("PUT key=%q result=%s clock=%s", key, result, newClock)
 
 	// Fan out to peers asynchronously without blocking the client
+	//
+	// Important Note: this is a over-simplification. In reality Dynamo uses
+	// Anti-entropy using Merkle trees
 	go n.replicate(key, vv)
 
 	w.Header().Set("Content-Type", "application/json")
